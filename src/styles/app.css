@@ -149,12 +149,21 @@ body {
 .eval-bar-track {
   width: 14px;
   height: 400px;
-  background: #1b1512;
   border: 1px solid var(--color-border);
   border-radius: 4px;
   overflow: hidden;
   display: flex;
-  flex-direction: column-reverse;
+  /* Black's fill stacks on top, White's on the bottom. */
+  flex-direction: column;
+}
+
+.eval-bar-black {
+  width: 100%;
+  /* Deliberately lighter than the page background (#17130f) so this
+     segment reads as a distinct "Black" fill instead of disappearing
+     into the surrounding dark UI. */
+  background: #4a4038;
+  transition: height 0.4s ease;
 }
 
 .eval-bar-white {
@@ -167,6 +176,14 @@ body {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--color-ivory-dim);
+}
+
+.eval-bar-label-black {
+  color: var(--color-ivory);
+}
+
+.eval-bar-label-white {
+  color: var(--color-ivory);
 }
 
 .checkbox-row {

@@ -9,6 +9,11 @@
 const MIN_ENGINE_ELO = 1320;
 const MAX_ENGINE_ELO = 3190;
 
+// Grace period added on top of the requested movetime before we give up on
+// a search and force the queue to move on. Generous, since a legitimate
+// search can run a little over its movetime budget under load.
+const SEARCH_TIMEOUT_GRACE_MS = 3000;
+
 class EngineService {
   constructor() {
     this.worker = null;
@@ -18,6 +23,10 @@ class EngineService {
     // (whether it's the bot picking its move or us grading a position for
     // feedback) is chained onto this promise so requests never overlap.
     this._queue = Promise.resolve();
+    // In-flight searches keyed by a request signature, so identical
+    // concurrent requests (e.g. React StrictMode's duplicate effect fire)
+    // share one search instead of piling up duplicates on the queue.
+    this._inFlight = new Map();
   }
 
   init() {
@@ -79,6 +88,15 @@ class EngineService {
   _search(fen, movetimeMs) {
     return new Promise((resolve) => {
       let score = null; // { cp } or { mate }
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        this.worker.removeEventListener('message', onMessage);
+        resolve(result);
+      };
 
       const onMessage = (e) => {
         const line = e.data;
@@ -90,9 +108,8 @@ class EngineService {
           if (mateMatch) score = { cp: null, mate: Number(mateMatch[1]) };
           else if (cpMatch) score = { cp: Number(cpMatch[1]), mate: null };
         } else if (line.startsWith('bestmove')) {
-          this.worker.removeEventListener('message', onMessage);
           const [, bestMove] = line.split(' ');
-          resolve({
+          finish({
             bestMove: bestMove === '(none)' ? null : bestMove,
             cp: score?.cp ?? null,
             mate: score?.mate ?? null,
@@ -100,10 +117,43 @@ class EngineService {
         }
       };
 
+      // Hard ceiling: if `bestmove` never arrives (dropped message, a WASM
+      // edge case on some position, etc.) this search must still resolve so
+      // it can't jam every later request chained onto the shared queue.
+      // We ask the engine to stop (in case it's just running long) and then
+      // give up on this search either way.
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        try {
+          this.worker.postMessage('stop');
+        } catch {
+          // worker may already be gone — nothing more we can do
+        }
+        finish({ bestMove: null, cp: null, mate: null, timedOut: true });
+      }, movetimeMs + SEARCH_TIMEOUT_GRACE_MS);
+
       this.worker.addEventListener('message', onMessage);
       this.worker.postMessage(`position fen ${fen}`);
       this.worker.postMessage(`go movetime ${movetimeMs}`);
     });
+  }
+
+  /**
+   * Run `fn()` but share the result with any other call currently in flight
+   * for the same `key`. Prevents duplicate searches from piling onto the
+   * queue when something fires the same request twice in quick succession
+   * (e.g. React StrictMode double-invoking an effect in dev).
+   */
+  _deduped(key, fn) {
+    const existing = this._inFlight.get(key);
+    if (existing) return existing;
+
+    const promise = fn().finally(() => {
+      // Only clear if we're still the current entry for this key.
+      if (this._inFlight.get(key) === promise) this._inFlight.delete(key);
+    });
+    this._inFlight.set(key, promise);
+    return promise;
   }
 
   /**
@@ -114,7 +164,10 @@ class EngineService {
    */
   async getBestMove(fen, { movetimeMs = 800 } = {}) {
     await this.ready;
-    return this._enqueue(() => this._search(fen, movetimeMs)).then((r) => r.bestMove);
+    const key = `bestmove:${fen}:${movetimeMs}:${this.currentRating}`;
+    return this._deduped(key, () => this._enqueue(() => this._search(fen, movetimeMs))).then(
+      (r) => r.bestMove
+    );
   }
 
   /**
@@ -134,15 +187,18 @@ class EngineService {
    */
   async analyze(fen, { movetimeMs = 500 } = {}) {
     await this.ready;
-    return this._enqueue(async () => {
-      this.worker.postMessage('setoption name UCI_LimitStrength value false');
-      const result = await this._search(fen, movetimeMs);
-      // Restore the bot's configured strength before it moves again.
-      const clamped = Math.min(MAX_ENGINE_ELO, Math.max(MIN_ENGINE_ELO, this.currentRating));
-      this.worker.postMessage('setoption name UCI_LimitStrength value true');
-      this.worker.postMessage(`setoption name UCI_Elo value ${clamped}`);
-      return result;
-    });
+    const key = `analyze:${fen}:${movetimeMs}`;
+    return this._deduped(key, () =>
+      this._enqueue(async () => {
+        this.worker.postMessage('setoption name UCI_LimitStrength value false');
+        const result = await this._search(fen, movetimeMs);
+        // Restore the bot's configured strength before it moves again.
+        const clamped = Math.min(MAX_ENGINE_ELO, Math.max(MIN_ENGINE_ELO, this.currentRating));
+        this.worker.postMessage('setoption name UCI_LimitStrength value true');
+        this.worker.postMessage(`setoption name UCI_Elo value ${clamped}`);
+        return result;
+      })
+    );
   }
 
   terminate() {
@@ -152,6 +208,7 @@ class EngineService {
       this.worker = null;
       this.ready = null;
       this._queue = Promise.resolve();
+      this._inFlight.clear();
     }
   }
 }
